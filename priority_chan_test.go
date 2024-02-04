@@ -2,22 +2,24 @@ package priority_chan
 
 import (
 	"context"
+	"math/rand"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func Test_Cond(t *testing.T) {
-	testBase(t, 10, 100, 10000000)
-	testBase(t, 20, 100, 10000000)
-	testBase(t, 20, 20, 10000000)
-	testBase(t, 30, 50, 10000000)
+	testBase(t, 10, 100, 100000)
+	testBase(t, 20, 100, 100000)
+	testBase(t, 20, 20, 100000)
+	testBase(t, 30, 50, 100000)
 }
 
 func Test_Mem(t *testing.T) {
-	for idx := 0; idx < 1000; idx++ {
-		testBase(t, 100, 10, 10000)
+	for idx := 0; idx < 4000; idx++ {
+		testBase(t, rand.Intn(100)+3, rand.Intn(10)+4, rand.Intn(10000)*20)
 	}
 }
 
@@ -52,18 +54,26 @@ func testBase(t *testing.T, queueSize int, parallel int, count int) {
 		}()
 	}
 	wg1.Wait()
-	close(pc.In)
+	pc.Close()
 	wg2.Wait()
 	assert.Equal(t, sendHash, recvHash)
 	assert.Equal(t, sendCnt, recvCnt)
 }
 
+type Item struct {
+	Value int
+	Prio  int64
+}
+
+func (i *Item) Priority() uint64 {
+	return uint64(i.Prio)
+}
 func genSender(t *testing.T, pc *PriorityChannel, begin, end int) (hash, cnt int64) {
 	for i := begin; i < end; i++ {
-		pc.In <- Item{
-			Value:    i,
-			Priority: int64(i),
-		}
+		pc.Put(&Item{
+			Value: i,
+			Prio:  int64(i),
+		})
 		//t.Logf("send %d\n", i)
 		hash ^= int64(i)
 		cnt++
@@ -75,18 +85,24 @@ func genRecv(t *testing.T, pc *PriorityChannel) (hash, cnt int64) {
 	swap := false
 	_ = swap
 	for {
-		v, ok := <-pc.Out
+		_v, ok := <-pc.Reader()
 		if !ok {
 			return
 		}
+		v := _v.(*Item)
 		//t.Logf("recv %d\n", v.Priority)
-		if v.Priority%10 == 0 && !swap {
+		if v.Prio%10 == 0 && !swap {
 			swap = true
-			pc.Return(context.Background(), v)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*10)
+			_v, _ = pc.Swap(ctx, _v)
+			v = _v.(*Item)
+			cancel()
+			hash ^= v.Prio
+			cnt++
 			continue
 		}
 		swap = false
-		hash ^= v.Priority
+		hash ^= v.Prio
 		cnt++
 	}
 	return

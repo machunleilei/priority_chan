@@ -1,139 +1,133 @@
 package priority_chan
 
 import (
-	"container/heap"
-	"context"
-	"errors"
-	"sync"
-	"sync/atomic"
-	"time"
+"container/heap"
+"context"
+"errors"
+"sync"
 )
 
 var (
 	ErrClosed = errors.New("PriorityChannel Closed")
 )
 
+type Prioritor interface {
+	Priority() uint64
+}
+
 // PriorityChannel as implemented by a min heap
 // ie. the 0th element is the *lowest* value.
 type PriorityChannel struct {
-	hp    itemHeap
-	In    chan<- Item //User need close In when done
-	Out   <-chan Item
-	inner atomic.Value
+	sync.RWMutex
+	hp       prioritorHeap
+	writerCh chan Prioritor //User need close In when done
+	readerCh chan Prioritor
+	swapin   chan Prioritor
+	swapout  chan Prioritor
+	exitFlag bool
+	exitch   chan struct{}
+}
+
+func (pc *PriorityChannel) Reader() <-chan Prioritor {
+	return pc.readerCh
+}
+func (pc *PriorityChannel) Put(val Prioritor) error {
+	pc.RLock()
+	defer pc.RUnlock()
+	if pc.exitFlag == true {
+		return ErrClosed
+	}
+	pc.writerCh <- val
+	return nil
 }
 
 // New creates a PriorityChannel of the given capacity.
 func New(capacity int) *PriorityChannel {
 	pc := PriorityChannel{
-		hp: make(itemHeap, 0, capacity+1),
+		hp:       make(prioritorHeap, 0, capacity+1),
+		writerCh: make(chan Prioritor),
+		readerCh: make(chan Prioritor),
+		swapin:   make(chan Prioritor),
+		swapout:  make(chan Prioritor),
+		exitch:   make(chan struct{}),
 	}
-	in := make(chan Item)
-	out := make(chan Item)
-	inner := make(chan Item)
-	pc.inner.Store(inner)
-	mtx := sync.Mutex{}
-	rctl := sync.NewCond(&mtx)
-	wctl := sync.NewCond(&mtx)
-	//returnCtl := sync.NewCond(&mtx)
-	wgRoutine := sync.WaitGroup{}
-	wgRoutine.Add(3)
-	exited := int32(0)
 	go func() {
-		defer wgRoutine.Done()
-		for {
-			// 队列满等待
-			mtx.Lock()
-			for pc.Len() >= capacity {
-				wctl.Wait()
+		defer func() {
+			close(pc.writerCh)
+			close(pc.readerCh)
+		}()
+		var prev Prioritor
+		changeItem := func(recv Prioritor, prev Prioritor) Prioritor {
+			heap.Push(&pc.hp, recv)
+			if prev != nil {
+				heap.Push(&pc.hp, prev)
 			}
-			mtx.Unlock()
-			item, ok := <-in
-			if !ok {
-				atomic.StoreInt32(&exited, 1)
-				return
-			}
-
-			mtx.Lock()
-			heap.Push(&pc.hp, item)
-			if pc.Len() == 1 {
-				rctl.Signal()
-			}
-			mtx.Unlock()
+			return heap.Pop(&pc.hp).(Prioritor)
 		}
-	}()
-
-	go func() { // 消费端
-		defer wgRoutine.Done()
+	EXIT:
 		for {
-			mtx.Lock()
-			for pc.Len() == 0 {
-				if atomic.LoadInt32(&exited) == 2 {
-					mtx.Unlock()
-					return
+			writer := pc.writerCh
+			reader := pc.readerCh
+			exit := pc.exitch
+			if len(pc.hp) >= cap(pc.hp) {
+				writer = nil
+			} else if pc.hp.Len() == 0 && prev == nil {
+				reader = nil
+			}
+			if pc.exitFlag {
+				writer = nil
+				if pc.hp.Len() == 0 && prev == nil { // read finish
+					break EXIT
 				}
-				rctl.Wait()
+				exit = nil
 			}
-			item := heap.Pop(&pc.hp).(Item)
-			if pc.Len() == capacity-1 {
-				wctl.Signal()
+			if prev == nil && pc.hp.Len() > 0 {
+				prev = heap.Pop(&pc.hp).(Prioritor)
 			}
-			mtx.Unlock()
-			out <- item
-		}
-	}()
 
-	go func() {
-		defer wgRoutine.Done()
-		var item Item
-		for {
 			select {
-			case item = <-inner:
-			case <-time.After(time.Second * 10):
-				if atomic.LoadInt32(&exited) == 1 {
-					pc.inner.Store((chan Item)(nil))
-					atomic.StoreInt32(&exited, 2)
-					rctl.Signal()
-					return
-				}
-				continue
+			case item := <-writer:
+				prev = changeItem(item, prev)
+			case reader <- prev:
+				prev = nil
+			case item := <-pc.swapin:
+				pc.swapout <- changeItem(item, prev)
+				prev = nil
+			case <-exit:
+				func() {
+					pc.Lock()
+					defer pc.Unlock()
+					pc.exitFlag = true
+					close(pc.swapin)
+					close(pc.swapout)
+					pc.swapin = nil
+					pc.swapout = nil
+				}()
 			}
-			mtx.Lock()
-			heap.Push(&pc.hp, item)
-			if pc.Len() == 1 {
-				rctl.Signal()
-			}
-			mtx.Unlock()
 		}
 	}()
-
-	go func() {
-		wgRoutine.Wait()
-		close(out)
-		close(inner)
-	}()
-
-	pc.In = in
-	pc.Out = out
 	return &pc
 }
 
-func (pc *PriorityChannel) Return(ctx context.Context, e Item) error {
-	var inner chan Item
-	for {
-		if val := pc.inner.Load(); val == nil {
-			return ErrClosed
-		} else {
-			inner = val.(chan Item)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case inner <- e:
-			return nil
-		case <-time.After(time.Second):
-			continue
-		}
+func (pc *PriorityChannel) Swap(ctx context.Context, e Prioritor) (Prioritor, error) {
+	pc.RLock()
+	defer pc.RUnlock()
+	if pc.exitFlag {
+		return e, ErrClosed
 	}
+	select {
+	case <-ctx.Done():
+		return e, ctx.Err()
+	case pc.swapin <- e:
+		t := <-pc.swapout
+		return t, nil
+	}
+}
+
+func (pc *PriorityChannel) Close() {
+	pc.Lock()
+	defer pc.Unlock()
+	close(pc.exitch)
 }
 
 // Len return length of priority queue
@@ -141,39 +135,33 @@ func (pc *PriorityChannel) Len() int {
 	return pc.hp.Len()
 }
 
-// Item in the itemHeap.
-type Item struct {
-	Value    interface{}
-	Priority int64
-}
-
-// itemHeap as implemented by a min heap
+// prioritorHeap as implemented by a min heap
 // ie. the 0th element is the *lowest* value.
-type itemHeap []Item
+type prioritorHeap []Prioritor
 
 // Len returns the length of the queue.
-func (h itemHeap) Len() int {
+func (h prioritorHeap) Len() int {
 	return len(h)
 }
 
 // Less returns true if the item at index i has a lower priority than the item
 // at index j.
-func (h itemHeap) Less(i, j int) bool {
-	return h[i].Priority < h[j].Priority
+func (h prioritorHeap) Less(i, j int) bool {
+	return h[i].Priority() < h[j].Priority()
 }
 
 // Swap the items at index i and j.
-func (h itemHeap) Swap(i, j int) {
+func (h prioritorHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 }
 
 // Push a new value to the queue.
-func (h *itemHeap) Push(x interface{}) {
-	*h = append(*h, x.(Item))
+func (h *prioritorHeap) Push(x interface{}) {
+	*h = append(*h, x.(Prioritor))
 }
 
 // Pop an item from the queue.
-func (h *itemHeap) Pop() interface{} {
+func (h *prioritorHeap) Pop() interface{} {
 	n := len(*h)
 	item := (*h)[n-1]
 	*h = (*h)[0 : n-1]
